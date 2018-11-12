@@ -28,19 +28,26 @@ writeFile a b = 'send' (WriteFile a b)
 @
 -}
 module Control.Monad.Freer.TH
-  ( makeEffect
-  , makeEffect_
-  )
+    ( makeEffect
+    , makeEffect_
+    )
 where
 
-import Control.Monad (forM, unless)
-import Control.Monad.Freer (send, Member, Eff)
-import Data.Char (toLower)
-import Data.List (nub)
-import Data.Maybe (mapMaybe)
-import Language.Haskell.TH
-import Prelude
+import           Control.Monad                  ( forM
+                                                , unless
+                                                )
+import           Control.Monad.Freer            ( send
+                                                , Member
+                                                , Eff
+                                                )
+import           Data.Char                      ( toLower )
+import           Data.List                      ( nub
+                                                , (\\)
+                                                )
+import           Language.Haskell.TH
+import           Prelude
 
+import           Debug.Trace
 
 -- | If @T@ is a GADT representing an effect algebra, as described in the module
 -- documentation for "Control.Monad.Freer", @$('makeEffect' ''T)@ automatically
@@ -74,71 +81,81 @@ makeEffect_ = genFreer False
 genFreer :: Bool -> Name -> Q [Dec]
 genFreer makeSigs tcName = do
   -- The signatures for the generated definitions require FlexibleContexts.
-  isExtEnabled FlexibleContexts
-    >>= flip unless (fail "makeEffect requires FlexibleContexts to be enabled")
+    isExtEnabled FlexibleContexts >>= flip
+        unless
+        (fail "makeEffect requires FlexibleContexts to be enabled")
 
-  reify tcName >>= \case
-    TyConI (DataD _ _ _ _ cons _) -> do
-      sigs <- filter (const makeSigs) <$> mapM genSig cons
-      decs <- mapM genDecl cons
-      return $ sigs ++ decs
+    reify tcName >>= \case
+        TyConI (DataD _ _ _ _ cons _) -> do
+            sigs <- filter (const makeSigs) <$> mapM genSig cons
+            decs <- mapM genDecl cons
+            return $ sigs ++ decs
 
-    _ -> fail "makeEffect expects a type constructor"
+        _ -> fail "makeEffect expects a type constructor"
 
 -- | Given the name of a GADT constructor, return the name of the corresponding
 -- lifted function.
 getDeclName :: Name -> Name
 getDeclName = mkName . overFirst toLower . nameBase
- where
-  overFirst f (a : as) = f a : as
-  overFirst _ as       = as
+  where
+    overFirst f (a : as) = f a : as
+    overFirst _ as       = as
 
 -- | Builds a function definition of the form @x a b c = send $ X a b c@.
 genDecl :: Con -> Q Dec
 genDecl (ForallC _       _     con) = genDecl con
 genDecl (GadtC   [cName] tArgs _  ) = do
-  let fnName = getDeclName cName
-  let arity  = length tArgs - 1
-  dTypeVars <- forM [0 .. arity] $ const $ newName "a"
-  return $ FunD fnName . pure $ Clause
-    (VarP <$> dTypeVars)
-    (NormalB . AppE (VarE 'send) $ foldl
-      (\b -> AppE b . VarE)
-      (ConE cName)
-      dTypeVars
-    )
-    []
+    let fnName = getDeclName cName
+    let arity  = length tArgs - 1
+    dTypeVars <- forM [0 .. arity] $ const $ newName "a"
+    return $ FunD fnName . pure $ Clause
+        (VarP <$> dTypeVars)
+        (NormalB . AppE (VarE 'send) $ foldl (\b -> AppE b . VarE)
+                                             (ConE cName)
+                                             dTypeVars
+        )
+        []
 genDecl _ = fail "genDecl expects a GADT constructor"
 
 -- | Generates a type signature of the form
 -- @x :: Member (Effect e) effs => a -> b -> c -> Eff effs r@.
 genSig :: Con -> Q Dec
-genSig (ForallC _       _      con                    ) = genSig con
-genSig (GadtC   [cName] tArgs' ctrType@(AppT eff tRet)) = do
-  effs <- newName "effs"
-  let
-    fnName    = getDeclName cName
-    tArgs     = fmap snd tArgs'
-    otherVars = unapply ctrType
-    quantifiedVars =
-      fmap PlainTV . nub $ effs : mapMaybe freeVarName (tArgs ++ otherVars)
-    memberConstraint = ConT ''Member `AppT` eff `AppT` VarT effs
-    resultType       = ConT ''Eff `AppT` VarT effs `AppT` tRet
+genSig f@(ForallC _ _ con) = traceShowM f >> genSig con
+genSig (GadtC [cName] tArgs' ctrType@(AppT eff tRet)) = do
+    effs <- newName "effs"
+    let fnName         = getDeclName cName
+        tArgs          = fmap snd tArgs'
+        otherVars      = unapply ctrType
+        quantifiedVars = fmap PlainTV . nub $ effs : concatMap
+            freeVarNames
+            (tArgs ++ otherVars)
+        memberConstraint = ConT ''Member `AppT` eff `AppT` VarT effs
+        resultType       = ConT ''Eff `AppT` VarT effs `AppT` tRet
 
-  return
-    .  SigD fnName
-    .  ForallT quantifiedVars [memberConstraint]
-    .  foldArrows
-    $  tArgs
-    ++ [resultType]
+    return
+        .  SigD fnName
+        .  ForallT quantifiedVars [memberConstraint]
+        .  foldArrows
+        $  tArgs
+        ++ [resultType]
 -- TODO: Although this should never happen, we obviously need a better error message below.
 genSig GadtC{} = fail "genSig can only look at applications (AppT)"
 genSig _       = fail "genSig expects a GADT constructor"
 
 -- | Gets the name of the free variable in the 'Type', if it exists.
-freeVarName :: Type -> Maybe Name
-freeVarName (VarT n) = Just n
-freeVarName _        = Nothing
+freeVarNames :: Type -> [Name]
+freeVarNames (ForallT bindings _ t) =
+    let varName tv = case tv of
+            (PlainTV name   ) -> name
+            (KindedTV name _) -> name
+    in  freeVarNames t \\ map varName bindings
+freeVarNames (AppT t1 t2     ) = freeVarNames t1 ++ freeVarNames t2
+freeVarNames (SigT t  _      ) = freeVarNames t
+freeVarNames (VarT n         ) = [n]
+freeVarNames (InfixT  t1 _ t2) = freeVarNames t1 ++ freeVarNames t2
+freeVarNames (UInfixT t1 _ t2) = freeVarNames t1 ++ freeVarNames t2
+freeVarNames (ParensT t      ) = freeVarNames t
+freeVarNames _                 = []
 
 -- | Folds a list of 'Type's into a right-associative arrow 'Type'.
 foldArrows :: [Type] -> Type
